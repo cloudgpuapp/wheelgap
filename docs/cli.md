@@ -86,31 +86,233 @@ stages before it, since it may name one of them: pass its value with [`--build-a
 
 ### `--dockerfile-inputs` {#dockerfile-inputs}
 
-`--dockerfile-inputs` (with `--dockerfile`, and no `INPUT`): check the requirements files the Dockerfile's final stage
-installs with `RUN pip install -r FILE`, on the image's Python and platform, so "will this image build without
-compiling anything?" is one command (add `--deps` for what they pull in). The file of a `pip install -r`
-line is read as a requirements file whatever its name (`requirements.pip`, `deps.py`, no extension), as pip reads it,
-except that a `pylock.toml` or `pylock.NAME.toml` is read as a lock, as pip 26.1 and later install it (a `uv pip install -r` line still takes only a `.txt` or `.in` file, since uv reads other names its own
-way). `FILE` is followed back through `WORKDIR` and `COPY` to a file in the build context, taken to be the
-Dockerfile's folder unless
-[`--dockerfile-context DIR`](#dockerfile-context) names another, and each one gets a note on stderr
-(`Dockerfile:4: RUN pip install -r reads requirements.txt`). The report says it too: in the header
-(`requirements.txt (Dockerfile:4)`), in `--json`'s [`dockerfile_inputs`](output.md#json) and in each
-`--github-annotations` message. `[tool.wheelgap]` and `.python-version` are read from
-that folder too. Without this flag, `--dockerfile` reads only the image.
+With `--dockerfile` and no positional input, `--dockerfile-inputs` checks the Python packages
+installed by supported lines in the Dockerfile's final stage. It uses the image's Python version
+and platform. Add `--deps` to check dependencies where the installer mode supports it. Without
+`--dockerfile-inputs`, `--dockerfile` reads only the image.
 
-**What the answer is.** The Python packages the final image gets from the `pip install` and `uv pip install` lines
+For a Dockerfile containing:
+
+```dockerfile
+FROM python:3.13-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+```
+
+put `packaging==25.0` in `requirements.txt` and run:
+
+```bash
+wheelgap --dockerfile Dockerfile --dockerfile-inputs
+```
+
+The output identifies the file and its install line, then reports one package with a wheel for
+the image target:
+
+```text
+wheelgap: note: Dockerfile:4: RUN pip install -r reads requirements.txt
+wheelgap 0.14.0 · requirements.txt (Dockerfile:4) · 1 package · Python 3.13
+
+✓ The 1 package has a wheel for 1 target.
+```
+
+#### Files and build context
+
+| Input | How wheelgap finds it |
+| --- | --- |
+| `-r FILE` | Follows `WORKDIR` and `COPY` back to the file in the build context. The build context defaults to the directory containing the Dockerfile. Use [`--dockerfile-context DIR`](#dockerfile-context) to override it. |
+| `-c FILE` | Follows the same path as `-r FILE` and records the constraints file in the stderr note. |
+| Nested `-r` / `-c` | Follows the include beside the including file **in the image** and verifies that it is the same file as the one beside it in the build context. |
+| Docker ignore rules | Uses `<Dockerfile name>.dockerignore` beside the Dockerfile if present. Otherwise uses `.dockerignore` at the build context root. Files excluded from the context are unavailable to `COPY`. |
+
+pip reads requirements files regardless of their name, such as `requirements.pip`, `deps.py` or a file with no
+extension. With pip 26.1 or later, `pylock.toml` or `pylock.NAME.toml` is read as a lock. uv reads requirements
+only from `.txt` or `.in` files. See the refusal conditions below for differences between the installers.
+
+Each install with a file input gets a note on stderr (`Dockerfile:4: RUN pip install -r reads requirements.txt`).
+Its input also appears in the report header (`requirements.txt (Dockerfile:4)`), in
+[`dockerfile_inputs`](output.md#json) under `--json`, and in each `--github-annotations` message.
+Wheelgap loads `[tool.wheelgap]` and `.python-version` from the build context.
+
+#### What the answer covers
+
+The Python packages the final image gets from the `pip install` and `uv pip install` lines
 wheelgap can read. It is not "everything in the image": system packages, what the base image ships and anything a
 script installs are outside it. 0.13.0 refuses a Dockerfile at the first `RUN` that isn't an install or a system
-package command; from 0.14.0 on, every line of the final stage falls into one of three groups, and the answer says
-which lines it did not look at.
+package command; from 0.14.0 on, wheelgap reports which Dockerfile lines it could read, which it skipped, and why it refused a build.
 
-| | Lines | What wheelgap does |
-| --- | --- | --- |
-| **Read** | `RUN pip install -r FILE` (also `pip3`, `python -m pip`, `python3 -m pip`, `/usr/local/bin/pip`, `uv pip install --system`; `pythonX.Y -m pip` and `pipX.Y` when X.Y is every Python checked; a venv's `pip` when an earlier `python -m venv` made it, also through `ENV PATH=/venv/bin:$PATH` (with `$NAME` from an earlier `ENV` or `ARG` expanded, as BuildKit does: `ENV PATH="$VIRTUAL_ENV/bin:$PATH"`) or `. /venv/bin/activate`; `python --version`, `pip --version`, `pip list`/`freeze`/`show`/`check`, which install nothing, whatever the PATH), alone, after `;`, or in a chain joined by `&&` that is the `RUN`'s last (an `&&` chain a `;` or a new line ends stops, below), with `-c FILE` and the flags listed below; `RUN pip install NAME`, `NAME==VERSION`, `"NAME>=1,<2"`, `NAME[extra]`, on the same lines (below); `WORKDIR` with a literal path (with none, the official python image's working folder is `/`, as BuildKit starts in `/` when the image sets no `WorkingDir`); plain `COPY SRC... DEST` from the build context (`--chown`, `--chmod`, `--link`); `cd DIR` before the install on the same `RUN`; `ENV`/`ARG` values used in the install (`-r $DIR/requirements.txt`), with `--build-arg` replacing an `ARG`'s default | Checks the packages, and names the file and line |
-| **Passed over, with a note** | A `RUN` command that can't install Python packages with pip or uv: system package and account commands (`apt-get`, `apk`, `dnf`, `useradd`, with `DEBIAN_FRONTEND=noninteractive` in front or exported), shell and file commands (`mkdir`, `chmod`, `rm`, `cp`, `ln`, `mv`, `tee`, `sed`, `echo`, `cd`, `set -eux`, `declare`, `if`/`for` around them, and redirects), as long as what they write isn't the image's Python or pip or a config folder (below), other programs (`curl`, `wget`, `git`, `go build`, `cargo fetch`, `cmake -E`, compilers), and the JavaScript package managers with their scripts turned off (`npm ci --ignore-scripts`, `yarn install --mode=skip-build`), installing named packages globally (`npm install -g pnpm@9`, `yarn global add serve`), which runs their scripts and not the project's, or only asked for their version or settings, as long as their arguments don't name an installer; `python -m venv`, `pip --version`/`list`/`check`, `RUN --mount=type=cache` or `tmpfs` over a folder that holds neither the requirements file nor a pip config file, `--network`, `--security`; `pip install` (with no pin or upper bound on `pip`) of only `pip`, `setuptools` and `wheel`; an `ARG PIP_...` with no default; `ENV`/`ARG` settings that don't change which files are picked (below); `COPY --from=STAGE-OR-IMAGE` of a single path that doesn't look like Python and is a file or lands in a bin folder (`/app/dist/main.js`, `COPY --from=node /usr/local/bin/node /usr/local/bin/`), listed as not followed; `SHELL` set to sh, dash, ash or bash with `-c` | One note per class on stderr with the line numbers (`not read, since they install no Python packages with pip or uv: system package and account commands, lines 3, 9`), and the same list in `--json`'s [`dockerfile_notes`](output.md#json) |
-| **Passed over, with a warning** | A line wheelgap can't see into, **after the last install it reads**: a script (`./install.sh`, `sh x.sh`, `bash -c "$CMD"`, `bash -lc`, `su -c`, `curl … \| sh`), `make`, `xargs`, `find -exec`, `awk` with `system()`, `eval`, `.`/`source` of a script, `python script.py` (also from a redirect or a pipe: `python < install.py`, `cat install.py \| python`), `python -c`, `python -m MODULE` other than pip and venv, a heredoc with no installer named in it, a `case` statement or a shell function with no installer named in it, `timeout`, `sudo -H` and programs wheelgap doesn't know, a package file (`dpkg -i x.deb`, `apt-get install ./x.deb`, `rpm -i`), a program that runs the project's own code (also before an install, below): a package.json script, named (`npm run`/`run-script`/`start`/`test`/`exec`/`explore`/`init`, `yarn`, `pnpm` and `bun` with a script name or `run`/`exec`/`dlx`, `deno run`/`task`) or a lifecycle one such as `postinstall` (`npm ci`/`install`/`pack`/`version`/`rebuild`, a bare `yarn`, `yarn`/`pnpm`/`bun install`, unless `--ignore-scripts` or yarn's `--mode=skip-build`), `npx`, a build file (`cargo build`/`check`/`install`/`run`/`test`, which run build.rs, `cmake` other than `-E` and `--version`, `ninja`, `mvn`, `gradle`, `dotnet`, `bundle`, `composer`) or a script file (`node FILE`, `go run`, `cmake -P`, `ruby FILE`, `php FILE`, `java -jar`, and `node`, `ruby` or `php` reading a script from a redirect or a pipe, `node < setup.js`), a program whose arguments name an installer (`node -e "…execSync('pip install x')"`, `ruby -e`, `sed 'e pip install x'`, `git -c alias.x='!pip install x' x`, `npm exec -- pip install x`), a write over the image's Python or pip (`ln -sf /usr/bin/python3 /usr/local/bin/python`, `update-alternatives --install /usr/bin/python3 …`, `cp`/`tee`/`>` onto `/usr/local/bin/pip`, `sed -i` in a Python's `lib/python3.X`, a `.pth` file, anything in a venv), `pip install pip==X` (or another pin or upper bound on pip); every other `COPY --from=STAGE-OR-IMAGE` (a folder may hold installed packages: a venv, `site-packages`, `--target` output, wheels), also before the install, as long as it doesn't land on the image's Python (a bin folder, `lib/python3.X`, `libpython`, `/root/.local`; another entry of a lib folder, `/usr/local/lib/node_modules`, is fine); an `ENV PATH`, `PYTHONPATH`, `VIRTUAL_ENV`, `PYTHONHOME` or `PYTHONUSERBASE` that names a copied folder, after the last install. After the last install read, such a line can add packages, but can't change what the read installs fetched. A `COPY --from` before an install can only bring packages pip keeps instead of fetching, so the answer checks more, not less (with `--deps` it stops: a kept older copy changes the dependency set) | The answer is still given, and the exit code is unchanged. Each line gets `wheelgap: warning: Dockerfile:8: this line runs … If it installs Python packages, or another Python, that is not in this answer` on stderr (also under `--quiet`). The text and `--markdown` headline says `The 3 packages wheelgap read have a wheel for 2 targets; line 8 wasn't seen into` instead of a green ✓, and the report's last line repeats the line numbers (text, `--quiet` and `--markdown`). `--json` lists them in [`dockerfile_warnings`](output.md#json) and sets `summary.complete` to `false`; [`--github-annotations`](#github-annotations) writes a `::warning` at the line, [`--sarif`](output.md#sarif) a `warning` result, and `--junit` a `wheelgap.dockerfile-warning` property and a `system-out` line in each suite |
-| **Stops, naming the line** | **Any line from the warning row that comes before an install wheelgap reads** (in an earlier `RUN`, or earlier on the same one), naming that line, except a program that runs the project's own code: that one is a warning there too (``this line runs `npm ci`, which runs the project's own code before the install on line 5, and may change what it installs``), so a full-stack Dockerfile still gets an answer, marked incomplete, and it stops only with `--deps`, as a `COPY --from` does. Otherwise a line before an install stops: it may rewrite the requirements file, write a pip config file, set `PIP_` values or change the pip and Python the install runs. A heredoc that names pip, python, uv or another installer, anywhere. A line that installs Python packages in a way that isn't read: `pip install .`, a path, a wheel or sdist file, a URL, `-e`, `-i` / `--index-url` / `--extra-index-url` / `--find-links` / `--no-index`, any other pip flag, `pip uninstall`/`download`/`config`, `uv sync` and every other `uv` command, `poetry`, `pdm`, `pipenv`, `conda`, `mamba`, `pipx`, `easy_install`, `hatch`, `pixi`, `python setup.py`. Another Python than the one checked: a pip or python at a path other than `/usr/local/bin` (`/usr/bin/python3` is Debian's, not the official image's; when `-p`/`-t` stand in for an image wheelgap can't read, `/usr/bin` and the other bin folders are read too) or a venv an earlier `python -m venv` made; `pythonX.Y`, `pipX.Y` or a venv made by one, when X.Y isn't every Python checked; a bare `pip`, `python` or `uv` after `ENV PATH`, `PATH=…`, `export PATH=…` or `. …/bin/activate` puts a folder first that isn't the image's or such a venv's, or after bash's `hash -p` names the file a command runs. An install that may not run or may fail unnoticed: after `\|\|`, after `&&` in a chain that a `;`, `&` or new line ends (`[ "$MODE" = dev ] && pip install -r dev.txt; …`), after an `exit` or `return` on the same `RUN`, negated with `!`, in a pipeline, in the background (also `cmd &> file` under sh, where `&>` is `&` then a redirect; under `SHELL ["/bin/bash", …]` it is a redirect), inside `if`/`for`/`while`/`{ }`/`( )`/`$( )`/`sh -c`/`case`/a function. An install whose `-r` or `-c` value has a variable with no known value, a command substitution or a glob, or follows a `cd` to an unknown folder, or uses a name an `ENV` and then an `ARG` with a value both set (BuildKit gives the `ARG`'s value, the classic builder the `ENV`'s). An install under `RUN --mount=type=bind`, `secret` or `ssh`, or under a cache or tmpfs mount over the requirements file's folder, a pip config folder, or a folder wheelgap can't resolve. A requirements file that an earlier unread command names, or names a folder or glob that covers it (`sed -i … requirements.txt`, `curl -o`, `git clone … .`), or that `tar`, `unzip` or `patch` in its folder, or `git checkout`/`pull`/`reset`/`stash`/`apply`/… anywhere, may have changed. A command that names a pip or uv config file (`pip.conf`, `uv.toml`, `.netrc`, `/etc/xdg/pip`) or writes a whole folder pip reads one from (`cp -r cfg/. /etc/`, `mv cfg /root/.config`, a home folder, `/usr/local`). `PIP_…`/`UV_…` set on the `RUN` (by an assignment, `export`, `declare -x` or `typeset -x`, or an `export` whose names aren't known, such as `export $(cat .env \| xargs)`) or by `ENV`/`ARG`, unless listed below. `ADD`, globs in `COPY`, a `COPY --from` that may put a requirements file where an install reads it, bring a pip or uv config file (also into a folder an `ENV HOME`, `XDG_CONFIG_HOME` or `XDG_CONFIG_DIRS` points pip at), or land on the image's Python or pip before an install (`/usr/local`, `/usr/local/lib`, the bin folders, `/root/.local`, a home folder, a venv), an `ENV PATH`/`PYTHONPATH`/`PYTHONUSERBASE`/`PYTHONHOME`/`VIRTUAL_ENV` naming a copied folder before an install, whether the `ENV` comes before the `COPY --from` or after it; a `COPY --from` into the working folder (or of a standard-library or pip module's name into it) before `python -m pip`, which imports from there first; with `--deps`, any `COPY --from` that may bring packages before an install; an `ENV` entry with a variable wheelgap can't expand (such as `$BASE/deps` with `BASE` an `ARG` with no value), which may be any folder a `COPY --from` fills; on a Windows image, any `RUN` that isn't one plain command (it runs in `cmd /S /C`, where `set X=…&& pip install` changes pip's settings); under a bash `SHELL`, any `RUN` after an `ENV` or `ARG` that sets `BASH_ENV` (bash runs that file first); `ONBUILD` in a stage the final stage builds on, a `SHELL` other than the above, a `# syntax=` frontend other than `docker/dockerfile` | Exit 2 with `path:line` and the reason; nothing is looked up |
+| Result | What you get |
+| --- | --- |
+| Package check | The packages and their Dockerfile lines or files. See the instruction table below. |
+| Note | Lines that install no packages with pip or uv. The package check still runs. |
+| Warning | A partial answer, with the usual exit status. |
+| Refusal | Exit 2 with the Dockerfile path, line and reason. Nothing is looked up. |
+
+##### Instructions wheelgap reads
+
+| Instruction | Supported form |
+| --- | --- |
+| `FROM` | The final stage and its parent chain. See [multi-stage builds](#dockerfile-stages). |
+| `WORKDIR` | A literal path. The official Python image starts in `/` unless the image sets a working directory. |
+| `COPY` | Plain `COPY SRC... DEST` from the build context, including `--chown`, `--chmod` and `--link`. |
+| `RUN` | Installs by package name or from `-r FILE`, with supported options below. A literal `cd DIR` can precede the install on the same line. |
+| `ENV` / `ARG` | Literal values used in the install (for example, `-r $DIR/requirements.txt`). `--build-arg` overrides an `ARG` default. |
+
+Install commands can use `pip`, `pip3`, `python -m pip`, `python3 -m pip`, `/usr/local/bin/pip` or
+`uv pip install --system`. `pythonX.Y -m pip` and `pipX.Y` are supported when X.Y is every Python
+checked. A venv's pip is supported when an earlier `python -m venv` made it, including through
+`ENV PATH=/venv/bin:$PATH` or `. /venv/bin/activate`. An earlier `ENV` or `ARG` supplies literal PATH
+variables such as `$VIRTUAL_ENV`. Version and state queries (`python --version`, `pip --version`,
+`pip list`, `pip freeze`, `pip show`, `pip check`) install nothing regardless of PATH.
+
+Put the install on its own, after a semicolon, or in the final `&&` chain of a `RUN`.
+See the refusal conditions below for chains that can make an install's execution uncertain.
+
+##### Instructions reported as notes
+
+- A `RUN` command that can't install Python packages with pip or uv: system package and account commands
+  (`apt-get`, `apk`, `dnf`, `useradd`, with `DEBIAN_FRONTEND=noninteractive` in front or exported)
+- shell and file commands (`mkdir`, `chmod`, `rm`, `cp`, `ln`, `mv`, `tee`, `sed`, `echo`, `cd`, `set
+  -eux`, `declare`, `if`/`for` around them, and redirects), as long as what they write isn't the image's
+  Python or pip or a config folder (below)
+- other programs (`curl`, `wget`, `git`, `go build`, `cargo fetch`, `cmake -E`, compilers)
+- JavaScript package managers with their scripts turned off (`npm ci --ignore-scripts`, `yarn install
+  --mode=skip-build`), installing named packages globally (`npm install -g pnpm@9`, `yarn global add
+  serve`), which runs their scripts and not the project's, or only asked for their version or settings,
+  as long as their arguments don't name an installer
+- `python -m venv`, `pip --version`/`list`/`check`, `RUN --mount=type=cache` or `tmpfs` over a folder
+  that holds neither the requirements file nor a pip config file, `--network`, `--security`
+- `pip install` (with no pin or upper bound on `pip`) of only `pip`, `setuptools` and `wheel`
+- an `ARG PIP_...` with no default
+- `ENV`/`ARG` settings that don't change which files are picked (below)
+- `COPY --from=STAGE-OR-IMAGE` of a single path that doesn't look like Python and is a file or lands in
+  a bin folder (`/app/dist/main.js`, `COPY --from=node /usr/local/bin/node /usr/local/bin/`), listed as
+  not followed
+- `SHELL` set to sh, dash, ash or bash with `-c`
+
+One note per class on stderr with the line numbers (`not read, since they install no Python packages
+with pip or uv: system package and account commands, lines 3, 9`), and the same list in `--json`'s
+[`dockerfile_notes`](output.md#json)
+
+##### Instructions reported as warnings
+
+Wheelgap reports commands it cannot inspect after the last install it reads. Some cases also warn before an install, as described below.
+
+- a script (`./install.sh`, `sh x.sh`, `bash -c "$CMD"`, `bash -lc`, `su -c`, `curl … | sh`)
+- `make`, `xargs`, `find -exec`, `awk` with `system()`, `eval`, `.`/`source` of a script, `python
+  script.py` (also from a redirect or a pipe: `python < install.py`, `cat install.py | python`),
+  `python -c`, `python -m MODULE` other than pip and venv, a heredoc with no installer named in it, a
+  `case` statement or a shell function with no installer named in it, `timeout`, `sudo -H` and programs
+  wheelgap doesn't know, a package file (`dpkg -i x.deb`, `apt-get install ./x.deb`, `rpm -i`)
+- a program that runs the project's own code (also before an install, below): a package.json script,
+  named (`npm run`/`run-script`/`start`/`test`/`exec`/`explore`/`init`, `yarn`, `pnpm` and `bun` with a
+  script name or `run`/`exec`/`dlx`, `deno run`/`task`) or a lifecycle one such as `postinstall` (`npm
+  ci`/`install`/`pack`/`version`/`rebuild`, a bare `yarn`, `yarn`/`pnpm`/`bun install`, unless
+  `--ignore-scripts` or yarn's `--mode=skip-build`), `npx`, a build file (`cargo
+  build`/`check`/`install`/`run`/`test`, which run build.rs, `cmake` other than `-E` and `--version`,
+  `ninja`, `mvn`, `gradle`, `dotnet`, `bundle`, `composer`) or a script file (`node FILE`, `go run`,
+  `cmake -P`, `ruby FILE`, `php FILE`, `java -jar`, and `node`, `ruby` or `php` reading a script from a
+  redirect or a pipe, `node < setup.js`)
+- a program whose arguments name an installer (`node -e "…execSync('pip install x')"`, `ruby -e`, `sed
+  'e pip install x'`, `git -c alias.x='!pip install x' x`, `npm exec -- pip install x`)
+- a write over the image's Python or pip (`ln -sf /usr/bin/python3 /usr/local/bin/python`,
+  `update-alternatives --install /usr/bin/python3 …`, `cp`/`tee`/`>` onto `/usr/local/bin/pip`, `sed -i`
+  in a Python's `lib/python3.X`, a `.pth` file, anything in a venv)
+- `pip install pip==X` (or another pin or upper bound on pip)
+- every other `COPY --from=STAGE-OR-IMAGE` (a folder may hold installed packages: a venv,
+  `site-packages`, `--target` output, wheels), also before the install, as long as it doesn't land on
+  the image's Python (a bin folder, `lib/python3.X`, `libpython`, `/root/.local`; another entry of a lib
+  folder, `/usr/local/lib/node_modules`, is fine)
+- an `ENV PATH`, `PYTHONPATH`, `VIRTUAL_ENV`, `PYTHONHOME` or `PYTHONUSERBASE` that names a copied
+  folder, after the last install.
+
+After the last install read, such a line can add packages, but can't change what the read installs
+fetched. A `COPY --from` before an install can only bring packages pip keeps instead of fetching, so the
+answer checks more, not less (with `--deps` it stops: a kept older copy changes the dependency set)
+
+The answer is still given, and the exit code is unchanged. Each line gets `wheelgap: warning:
+Dockerfile:8: this line runs … If it installs Python packages, or another Python, that is not in this
+answer` on stderr (also under `--quiet`). The text and `--markdown` headline says `The 3 packages
+wheelgap read have a wheel for 2 targets; line 8 wasn't seen into` instead of a green ✓, and the
+report's last line repeats the line numbers (text, `--quiet` and `--markdown`). `--json` lists them in
+[`dockerfile_warnings`](output.md#json) and sets `summary.complete` to `false`; [`--github-
+annotations`](#github-annotations) writes a `::warning` at the line, [`--sarif`](output.md#sarif) a
+`warning` result, and `--junit` a `wheelgap.dockerfile-warning` property and a `system-out` line in each
+suite
+
+##### Why wheelgap refuses a Dockerfile
+
+- **Any line from the warning row that comes before an install wheelgap reads** (in an earlier `RUN`, or
+  earlier on the same one), naming that line, except a program that runs the project's own code: that
+  one is a warning there too (``this line runs `npm ci`, which runs the project's own code before the
+  install on line 5, and may change what it installs``), so a full-stack Dockerfile still gets an
+  answer, marked incomplete, and it stops only with `--deps`, as a `COPY --from` does. Otherwise a line
+  before an install stops: it may rewrite the requirements file, write a pip config file, set `PIP_`
+  values or change the pip and Python the install runs.
+- A heredoc that names pip, python, uv or another installer, anywhere.
+- A line that installs Python packages in a way that isn't read: `pip install .`, a path, a wheel or
+  sdist file, a URL, `-e`, `-i` / `--index-url` / `--extra-index-url` / `--find-links` / `--no-index`,
+  any other pip flag, `pip uninstall`/`download`/`config`, `uv sync` and every other `uv` command,
+  `poetry`, `pdm`, `pipenv`, `conda`, `mamba`, `pipx`, `easy_install`, `hatch`, `pixi`, `python
+  setup.py`.
+- Another Python than the one checked: a pip or python at a path other than `/usr/local/bin`
+  (`/usr/bin/python3` is Debian's, not the official image's; when `-p`/`-t` stand in for an image
+  wheelgap can't read, `/usr/bin` and the other bin folders are read too) or a venv an earlier `python
+  -m venv` made; `pythonX.Y`, `pipX.Y` or a venv made by one, when X.Y isn't every Python checked; a
+  bare `pip`, `python` or `uv` after `ENV PATH`, `PATH=…`, `export PATH=…` or `. …/bin/activate` puts a
+  folder first that isn't the image's or such a venv's, or after bash's `hash -p` names the file a
+  command runs.
+- An install that may not run or may fail unnoticed: after `||`, after `&&` in a chain that a `;`, `&`
+  or new line ends (`[ "$MODE" = dev ] && pip install -r dev.txt; …`), after an `exit` or `return` on
+  the same `RUN`, negated with `!`, in a pipeline, in the background (also `cmd &> file` under sh, where
+  `&>` is `&` then a redirect; under `SHELL ["/bin/bash", …]` it is a redirect), inside
+  `if`/`for`/`while`/`{ }`/`( )`/`$( )`/`sh -c`/`case`/a function.
+- An install whose `-r` or `-c` value has a variable with no known value, a command substitution or a
+  glob, or follows a `cd` to an unknown folder, or uses a name an `ENV` and then an `ARG` with a value
+  both set (BuildKit gives the `ARG`'s value, the classic builder the `ENV`'s).
+- An install under `RUN --mount=type=bind`, `secret` or `ssh`, or under a cache or tmpfs mount over the
+  requirements file's folder, a pip config folder, or a folder wheelgap can't resolve.
+- A requirements file that an earlier unread command names, or names a folder or glob that covers it
+  (`sed -i … requirements.txt`, `curl -o`, `git clone … .`), or that `tar`, `unzip` or `patch` in its
+  folder, or `git checkout`/`pull`/`reset`/`stash`/`apply`/… anywhere, may have changed.
+- A command that names a pip or uv config file (`pip.conf`, `uv.toml`, `.netrc`, `/etc/xdg/pip`) or
+  writes a whole folder pip reads one from (`cp -r cfg/. /etc/`, `mv cfg /root/.config`, a home folder,
+  `/usr/local`).
+- `PIP_…`/`UV_…` set on the `RUN` (by an assignment, `export`, `declare -x` or `typeset -x`, or an
+  `export` whose names aren't known, such as `export $(cat .env | xargs)`) or by `ENV`/`ARG`, unless
+  listed below.
+- `ADD`, globs in `COPY`, a `COPY --from` that may put a requirements file where an install reads it,
+  bring a pip or uv config file (also into a folder an `ENV HOME`, `XDG_CONFIG_HOME` or
+  `XDG_CONFIG_DIRS` points pip at), or land on the image's Python or pip before an install
+  (`/usr/local`, `/usr/local/lib`, the bin folders, `/root/.local`, a home folder, a venv), an `ENV
+  PATH`/`PYTHONPATH`/`PYTHONUSERBASE`/`PYTHONHOME`/`VIRTUAL_ENV` naming a copied folder before an
+  install, whether the `ENV` comes before the `COPY --from` or after it; a `COPY --from` into the
+  working folder (or of a standard-library or pip module's name into it) before `python -m pip`, which
+  imports from there first; with `--deps`, any `COPY --from` that may bring packages before an install;
+  an `ENV` entry with a variable wheelgap can't expand (such as `$BASE/deps` with `BASE` an `ARG` with
+  no value), which may be any folder a `COPY --from` fills
+- on a Windows image, any `RUN` that isn't one plain command (it runs in `cmd /S /C`, where `set X=…&&
+  pip install` changes pip's settings)
+- under a bash `SHELL`, any `RUN` after an `ENV` or `ARG` that sets `BASH_ENV` (bash runs that file
+  first)
+- `ONBUILD` in a stage the final stage builds on, a `SHELL` other than the above, a `# syntax=` frontend
+  other than `docker/dockerfile`
+- **uv input format.** Use `.txt` or `.in` files and plain `-r FILE` or `-c FILE` option lines. uv reads
+    other names as locks, scripts or projects. Index or candidate-selection options such as `--extra-index-url`,
+    `--index-url`, `--no-binary`, `--only-binary` and `--pre`, plus `-e`, are refused inside uv input files.
+    With a second index, uv takes the first index that has the package, while pip chooses the best file across indexes.
+    A requirement with its own `--hash` is fine.
+- **uv constraints and pins.** In a constraints file, pip can follow `-r` and install the packages it names.
+  uv only constrains those packages, so wheelgap refuses the include. Use a top-level `-r` for requirements you want to
+  install. Pin every uv requirement with `==` directly or through a constraint and leave off `--deps`. Without pins,
+  pip and uv can choose different versions. Wheelgap names the line, requirement and file.
+- **uv configuration.** After 0.14.0, a `COPY` before the uv line refuses the build when any file it brings is
+  a non-empty `uv.toml` or a `pyproject.toml` with a non-empty `[tool.uv]` table. An earlier unread `RUN` that
+  names either file is also refused. Version 0.14.0 refuses any copied `pyproject.toml` and already refuses
+  an earlier unread command naming `uv.toml`. A settings file that is invalid TOML, is not UTF-8, or is a symlink
+  inside a copied directory is refused with its build-context path. Copy the requirements file alone and run
+  `uv pip install` before copying the configuration.
+- **Mixed installers.** Use one installer for each input file. Wheelgap refuses a file used by both pip and uv.
 
 When no install line is left to read, that is an error too, and it names the lines it couldn't see into.
 
@@ -121,43 +323,19 @@ last install it reads, such a line can still add packages, but can't change the 
 answer is given with the warning. A heredoc's body isn't split into commands: one that names an installer stops
 wherever it is, and any other is a line wheelgap can't see into.
 
-**Multi-stage builds** (0.13.0 reads only a final stage built `FROM` an image). The final image
-is the final stage on top of the stage it is built `FROM`, and so on back to an image, so wheelgap reads that chain
-of stages in order, as one: an install in `FROM python:3.13 AS base` counts when the last stage is `FROM base`, and
-the parent's `WORKDIR`, copied files, `ENV`, `SHELL` and anything that stops (an `ENV PIP_INDEX_URL`, a
-`poetry install`) count too, each with its own line. Stages that aren't on the chain (a `builder` the final stage
-only copies from) aren't read at all. Two things are deliberately not guessed:
+#### Multi-stage builds {#dockerfile-stages}
 
-- `COPY --from=builder …` brings files wheelgap doesn't follow. Where they land is known, so an install that reads
-  a requirements file from under that folder is an error, and so is a copy that could carry a pip or uv config
-  file (into `/`, `/etc`, `/root`, `/usr/local`, a home folder, a folder `ENV HOME` or `XDG_CONFIG_*` points pip
-  at; or any such copy before a `uv pip install`), and one that lands on the image's Python or pip before an
-  install. Otherwise the copy is passed over with a warning, since a folder from a builder stage is how its
-  environment usually reaches the final image (`pip install --target=/packages` there, `COPY --from=build
-  /packages /packages` and `ENV PYTHONPATH=/packages` here). Only a single file that doesn't look like Python, or
-  one into a bin folder, is a note that says it wasn't followed.
-- An `ARG` declared in a parent stage: newer BuildKit keeps its value in the stage built on it and older ones
-  don't, so an install in a later stage that needs the value is an error. Declare the `ARG` again in that stage.
+| First supported | Purpose | Options |
+| --- | --- | --- |
+| 0.13.0 | Cache | `--no-cache-dir` |
+| 0.14.0 | Upgrade | `--upgrade` / `-U` |
+| 0.14.0 | Prompts and output | `--disable-pip-version-check`, `--root-user-action ignore` or `warn` (also `=ignore` or `=warn`), `--no-input`, `-q` / `--quiet`, `--progress-bar auto` / `on` / `off` / `raw` (also `=off`), `--no-warn-script-location`, `--no-color` |
+| 0.14.0 | Installation | `--no-compile`, `--compile`, `--break-system-packages` |
+| 0.14.0 | Network | `--retries N`, `--timeout SECONDS`, `--default-timeout SECONDS` (also `=N`) |
+| 0.14.0 | Dependencies | `--no-deps` is supported unless wheelgap runs with `--deps`, since the line installs no dependencies. |
+| 0.14.0 | Conditions and constraints | `-c FILE` / `--constraint FILE`, multiple `-r FILE` options, and `--prefer-binary` with pinned requirements and no `--deps`. See conditions below. |
 
-A `FROM ${NAME}` on the chain that wheelgap can't expand is an error when a named stage comes before it, since it
-may name that stage; `--target` builds (stopping at an earlier stage) aren't read.
-
-How a `RUN` is split: the text after `RUN` (and its `--mount`/`--network`/`--security` flags) is what Docker hands
-to `/bin/sh -c`, so wheelgap splits it into commands by the POSIX shell's rules: quotes and backslashes, `&&`, `||`,
-`;`, `|`, `&`, redirects, comments, `$NAME` and `${NAME}` (replaced when an earlier `ENV`, an `ARG` with a value or
-an assignment on the same line gives a literal value; anything else makes the word unknown), command substitutions
-(their commands are classified too). A glob, a leading `~` and a bash brace list make a word unknown rather than
-being expanded. `&>` and `&>>` are read as dash and ash run them, `&` and then a redirect, unless the `SHELL` is bash. A command is classified by its name, after `sudo`, `exec`, `env NAME=VALUE` and `command`. Limits to
-know: a program that runs the project's own code before an install (`npm ci && npm run build`) is a warning, not a
-stop, so the answer is given though that code may change what the install fetches; and a command that changes a requirements file without naming it, its folder or a matching glob (through
-a variable, say) isn't noticed.
-
-Flags read on the `pip install` line (0.13.0 reads only `--no-cache-dir`): `--no-cache-dir`, `--upgrade` /
-`-U`, `--disable-pip-version-check`, `--root-user-action ignore` or `=ignore` (or `warn`), `--no-input`, `-q` /
-`--quiet`, `--no-compile`, `--compile`, `--progress-bar auto` / `on` / `off` / `raw` (or `=off`),
-`--no-warn-script-location`, `--no-color`, `--break-system-packages`, `--retries N`, `--timeout SECONDS` and
-`--default-timeout SECONDS` (or `=N`), `--no-deps` (with `--deps` it is an error, since the line installs no
-dependencies), and:
+Options that affect which requirements are resolved:
 
 - `-c FILE` / `--constraint FILE`: the constraints file is followed back through `WORKDIR` and `COPY` like `-r FILE`,
   with the same refusals, and applied to the line's requirements files as a `-c FILE` line at the top of each would
@@ -201,6 +379,8 @@ Every requirement is checked as a fresh install. pip keeps a package the image a
 requirement, so when a system package command installs Python packages (`apk add py3-yaml`,
 `apt-get install python3-numpy`), a note names them: the build may not fetch every package the answer checks.
 
+#### Packages named directly
+
 Requirements named on the install line (0.13.0 refuses them): `RUN pip install numpy==2.3.4`,
 `pip install "numpy<3" pandas`, `pip install uvicorn[standard]`, alone or beside `-r FILE`. They are checked the way
 requirements given on wheelgap's own command line are (`wheelgap numpy==2.3.4 pandas`): a pin is that version, and
@@ -243,33 +423,31 @@ An include that no `COPY` puts there (pip would stop the build), one where a `CO
 `${VAR}`, an absolute path, an abbreviated option (`--req`), an include on a line with an editable, or a symlink
 anywhere in the chain is still an error naming the `RUN` line.
 
-`RUN uv pip install --system -r FILE` is read too (0.13.0 refuses it), with the
-`COPY --from=ghcr.io/astral-sh/uv[:TAG] /uv /uvx DEST/` that puts uv in the image (`/uvx` is optional). `FILE` is
-found, and its includes are verified, as for pip. `--system` (or an earlier `ENV UV_SYSTEM_PYTHON=1`) is required,
-since without it uv installs into a virtual environment; `-c FILE` (or `--constraints FILE`), `--no-cache`,
-`--no-cache-dir`, `--upgrade` / `-U`, `-q` / `--quiet`, `--compile-bytecode` (and its alias `--compile`),
-`--no-progress`, `--link-mode clone` / `copy` / `hardlink` / `symlink` (or `=copy`), `--break-system-packages`,
-`--strict` (it only warns after the install), `--no-python-downloads` and `--no-deps` are read, and any other flag is
-an error, pip's own among them (`--no-input`, `--disable-pip-version-check`, `--root-user-action`, `--prefer-binary`,
-`--no-compile`, `--progress-bar`, `--no-warn-script-location`, `--no-color`, `--retries`, `--timeout`). The answer
-follows uv, not pip: uv checks only the lower bound of a
+#### uv options and constraints
+
+Wheelgap reads `RUN uv pip install --system -r FILE` (0.13.0 refuses it). The image must contain uv from
+`COPY --from=ghcr.io/astral-sh/uv[:TAG] /uv /uvx DEST/` (`/uvx` is optional). It finds `FILE` and verifies the
+includes as it would for pip.
+
+| Purpose | Supported options since wheelgap 0.14.0 |
+| --- | --- |
+| Install into system Python | `--system` or an earlier `ENV UV_SYSTEM_PYTHON=1`. Required because uv otherwise installs into a virtual environment. |
+| Constraints | `-c FILE` / `--constraints FILE` |
+| Cache and upgrade | `--no-cache`, `--no-cache-dir`, `--upgrade` / `-U` |
+| Output and validation | `-q` / `--quiet`, `--no-progress`, `--strict` (warns after installation) |
+| Installation | `--compile-bytecode` / `--compile`, `--link-mode clone` / `copy` / `hardlink` / `symlink` (also `=copy`), `--break-system-packages`, `--no-python-downloads`, `--no-deps` |
+
+Any other flag is an error, including pip-specific options such as `--no-input`, `--disable-pip-version-check`,
+`--root-user-action`, `--prefer-binary`, `--no-compile`, `--progress-bar`, `--no-warn-script-location`,
+`--no-color`, `--retries` and `--timeout`.
+
+##### How the answer differs for uv
+
+uv checks only the lower bound of a
 release's `Requires-Python`, so a pin that pip refuses for an upper bound is checked as uv installs it, and the report
-says which packages that changes (`pip_refuses` in `--json`). For a range the two can pick different versions, and
-wheelgap picks as pip does, so under uv every requirement must be pinned with `==` (in `FILE`, in a file it includes,
-or by a constraints file) and `--deps` can't be used: an unpinned requirement is an error naming the `RUN` line, the
-requirement and its file. These are errors as well: a file not named `*.txt` or `*.in` (uv reads other names as
-locks, scripts or projects), an option line other than a plain `-r FILE` or `-c FILE` in any file the line reads
-(`--extra-index-url`, `--index-url`, `--no-binary`, `--only-binary`, `--pre`, `-e`: uv reads these by its own rules,
-and with a second index it takes the first one that has the package, where pip takes the best file of them all; a
-requirement with its own `--hash` is fine), a `-r` inside a constraints file (pip installs what it names, uv only
-constrains with it), a `uv.toml` or `pyproject.toml` the image's `uv pip install` would read settings from: a
-non-empty `uv.toml` a `COPY` brings before the uv line, or a `pyproject.toml` with a non-empty `[tool.uv]` table,
-anywhere in what it copies (**after 0.14.0**; 0.14.0 refuses any copied `pyproject.toml`), and an earlier `RUN`
-command wheelgap can't see into that names a `pyproject.toml` (**after 0.14.0**), as one that names a `uv.toml` is. A plain `pyproject.toml` — `COPY . .`
-brings one for nearly every project — is fine, as is a `uv.toml` that sets nothing; a file that isn't valid TOML or
-isn't UTF-8, or that is a symlink inside a copied folder, is refused, naming its path in the build context. The way
-out is to copy the requirements file alone and run `uv pip install` before the `COPY` that brings it. Also errors: a
-file that pip installs on one line and uv on another, and every other `uv` command (`uv sync`, `uv add`, `uv pip sync`).
+says which packages that changes (`pip_refuses` in `--json`).
+
+#### Docker ignore rules
 
 A `.dockerignore` is read as BuildKit reads it (0.13.0 refuses any project that has one):
 `<Dockerfile name>.dockerignore` beside the Dockerfile if there is one, otherwise `.dockerignore` at the root of the
